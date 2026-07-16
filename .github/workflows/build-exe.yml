@@ -1,0 +1,80 @@
+name: Build Windows EXE
+
+# Triggers:
+#  - Push to main          → builds and uploads as a workflow artifact
+#  - Push a tag like v1.0.0 → builds AND attaches the exe to a GitHub Release
+#  - Manual "Run workflow"  → build on demand from the Actions tab
+on:
+  push:
+    branches: [ main ]
+    tags: [ 'v*' ]
+  pull_request:
+    branches: [ main ]
+  workflow_dispatch:
+
+env:
+  POPPLER_VERSION: 24.08.0-0   # oschwartz10612/poppler-windows release tag to bundle
+
+jobs:
+  build:
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install Python dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install pyinstaller
+
+      - name: Download & bundle Poppler for Windows
+        shell: pwsh
+        run: |
+          $ver = "${{ env.POPPLER_VERSION }}"
+          $url = "https://github.com/oschwartz10612/poppler-windows/releases/download/v$ver/Release-$ver.zip"
+          Write-Host "Downloading Poppler from $url"
+          Invoke-WebRequest -Uri $url -OutFile poppler.zip
+
+          Expand-Archive -Path poppler.zip -DestinationPath poppler_tmp
+
+          $binDir = Get-ChildItem -Path poppler_tmp -Recurse -Directory -Filter "bin" | Select-Object -First 1
+          if (-not $binDir) {
+            Write-Error "Could not locate a 'bin' folder inside the downloaded Poppler archive."
+            exit 1
+          }
+
+          New-Item -ItemType Directory -Force -Path "poppler\bin" | Out-Null
+          Copy-Item -Path "$($binDir.FullName)\*" -Destination "poppler\bin" -Recurse -Force
+
+          Write-Host "Poppler bundled at poppler\bin:"
+          Get-ChildItem "poppler\bin" | Select-Object -First 5 | Format-Table Name
+
+      - name: Build EXE with PyInstaller
+        run: pyinstaller build.spec --noconfirm
+
+      - name: Zip the build output
+        shell: pwsh
+        run: |
+          Compress-Archive -Path "dist\DocSealerBatch\*" -DestinationPath "DocSealerBatch-windows.zip"
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: DocSealerBatch-windows
+          path: DocSealerBatch-windows.zip
+          retention-days: 30
+
+      - name: Create GitHub Release (tag pushes only)
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: DocSealerBatch-windows.zip
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
