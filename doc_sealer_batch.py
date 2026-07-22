@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
 """
 DocSealer Batch — Desktop App
-Each input file (JPG / PNG / HEIC / PDF / TIFF / …) → one sealed TIFF per page.
-Output TIFFs are named originalname_pageN_sealed.tiff
+ALL input files (JPG / PNG / HEIC / PDF / TIFF / … — any mix of formats)
+are merged together, every page of every file is sealed, and the WHOLE
+batch produces exactly ONE combined, multi-frame sealed TIFF — kept under
+5 MB regardless of how many input files or pages there are.
 Run: python3 doc_sealer_batch.py
 """
 
@@ -270,10 +272,12 @@ class SealPreview(QLabel):
 # ═══════════════════════════════════════════════════════════════════════════════
 class BatchWorker(QThread):
     batch_progress = pyqtSignal(int, str)
-    page_started   = pyqtSignal(int, int)
-    page_done      = pyqtSignal(int, int, float, str)
-    page_failed    = pyqtSignal(int, int, str)
-    all_done       = pyqtSignal(int, int)
+    file_started   = pyqtSignal(int)              # file_idx — sealing started
+    file_sealed    = pyqtSignal(int)              # file_idx — pages sealed & merged OK
+    file_failed    = pyqtSignal(int, str)         # file_idx, error traceback
+    # success, size_mb, out_name, err, files_ok, files_failed — fires exactly
+    # once at the end of the whole batch, for the single combined output file.
+    combined_done  = pyqtSignal(bool, float, str, str, int, int)
 
     def __init__(self, input_files: list, seal_path: str, output_folder: str):
         super().__init__()
@@ -386,26 +390,21 @@ class BatchWorker(QThread):
         buf.seek(0)
         return buf.getvalue()
 
-    # ── Filename builder ──────────────────────────────────────────────────────
-    @staticmethod
-    def _build_filename(fp: Path) -> str:
-        return f"{fp.stem}_sealed.tiff"
-
-    # ── Render + save (ONE output file per input, all pages combined) ─────────
-    def _render_multipage_tiff(self, fp: Path, sealed_pdf: Path) -> tuple:
+    # ── Render + save (ONE output file for the ENTIRE batch) ──────────────────
+    def _render_combined_tiff(self, sealed_pdf: Path) -> tuple:
         """
-        Render every sealed page and combine them into a SINGLE multi-frame
-        TIFF (input file → output file, 1:1 — no per-page splitting).
-        The whole combined file is kept under MAX_TIFF_BYTES by lowering the
+        Render every sealed page (from every input file, already merged into
+        one PDF) and combine them into a SINGLE multi-frame TIFF — the whole
+        batch → one output file. Kept under MAX_TIFF_BYTES by lowering the
         render DPI for ALL pages together and re-checking total size.
         """
-        out_name = self._build_filename(fp)
-
-        out_path = self.output_folder / out_name
-        counter  = 1
-        base     = out_name.replace(".tiff", "")
+        base_name = "combined_sealed"
+        out_name  = f"{base_name}.tiff"
+        out_path  = self.output_folder / out_name
+        counter   = 1
         while out_path.exists():
-            out_path = self.output_folder / f"{base}_{counter}.tiff"
+            out_name = f"{base_name}_{counter}.tiff"
+            out_path = self.output_folder / out_name
             counter += 1
 
         dpi = RENDER_DPI_START
@@ -441,40 +440,54 @@ class BatchWorker(QThread):
 
     # ── Main run ──────────────────────────────────────────────────────────────
     def run(self):
-        successes = 0
-        failures  = 0
-
         self.batch_progress.emit(0, "Loading seal image…")
         seal_img = Image.open(self.seal_path).convert("RGBA")
 
-        total_pages      = 0
+        # Convert every input file to PDF bytes ONCE and reuse it for both the
+        # progress-bar page count and the actual sealing pass below.
+        pdf_bytes_list   = []
         file_page_counts = []
+        total_pages      = 0
         for fp in self.input_files:
             try:
                 pdf_bytes = self._file_to_pdf_bytes(fp)
-                count = len(PdfReader(io.BytesIO(pdf_bytes)).pages)
+                count     = len(PdfReader(io.BytesIO(pdf_bytes)).pages)
             except Exception:
-                count = 1
+                pdf_bytes = None
+                count     = 1
+            pdf_bytes_list.append(pdf_bytes)
             file_page_counts.append(count)
             total_pages += count
 
-        pages_done = 0
-        n_files    = len(self.input_files)
+        pages_done   = 0
+        n_files      = len(self.input_files)
+        files_ok     = 0
+        files_failed = 0
 
-        for file_idx, fp in enumerate(self.input_files):
-            self.batch_progress.emit(
-                int(100 * pages_done / max(total_pages, 1)),
-                f"Processing {fp.name}  ({file_idx + 1}/{n_files})…")
-            # One result row per input file (output is 1:1 with input now).
-            self.page_started.emit(file_idx, 0)
-            try:
-                pdf_bytes = self._file_to_pdf_bytes(fp)
-                rdr       = PdfReader(io.BytesIO(pdf_bytes))
-                n_pages   = len(rdr.pages)
+        combined_writer     = PdfWriter()
+        total_sealed_pages  = 0
 
-                with tempfile.TemporaryDirectory() as tmp_dir:
-                    tmp    = Path(tmp_dir)
-                    writer = PdfWriter()
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            tmp = Path(tmp_dir)
+
+            for file_idx, fp in enumerate(self.input_files):
+                self.batch_progress.emit(
+                    int(100 * pages_done / max(total_pages, 1)),
+                    f"Processing {fp.name}  ({file_idx + 1}/{n_files})…")
+                self.file_started.emit(file_idx)
+
+                pdf_bytes = pdf_bytes_list[file_idx]
+                if pdf_bytes is None:
+                    files_failed += 1
+                    self.file_failed.emit(
+                        file_idx, f"Could not convert {fp.name} to PDF.")
+                    pages_done += max(file_page_counts[file_idx], 1)
+                    continue
+
+                try:
+                    rdr     = PdfReader(io.BytesIO(pdf_bytes))
+                    n_pages = len(rdr.pages)
+
                     for page_idx, page in enumerate(rdr.pages):
                         self.batch_progress.emit(
                             int(100 * pages_done / max(total_pages, 1)),
@@ -486,36 +499,45 @@ class BatchWorker(QThread):
                             io.BytesIO(self._make_seal_overlay(pw, ph, seal_img, rot))
                         ).pages[0]
                         page.merge_page(overlay)
-                        writer.add_page(page)
+                        combined_writer.add_page(page)
+                        total_sealed_pages += 1
                         pages_done += 1
 
-                    sealed_pdf = tmp / "sealed.pdf"
-                    with open(str(sealed_pdf), "wb") as fh:
-                        writer.write(fh)
+                    files_ok += 1
+                    self.file_sealed.emit(file_idx)
 
-                    self.batch_progress.emit(
-                        int(100 * pages_done / max(total_pages, 1)),
-                        f"{fp.name} — combining {n_pages} page(s) into one TIFF…")
-                    try:
-                        _, size_mb, display = self._render_multipage_tiff(
-                            fp, sealed_pdf)
-                        successes += 1
-                        self.page_done.emit(file_idx, 0, size_mb, display)
-                    except Exception:
-                        import traceback
-                        failures += 1
-                        self.page_failed.emit(
-                            file_idx, 0, traceback.format_exc())
+                except Exception:
+                    import traceback
+                    files_failed += 1
+                    self.file_failed.emit(file_idx, traceback.format_exc())
+                    pages_done += max(file_page_counts[file_idx], 1)
 
+            if total_sealed_pages == 0:
+                self.batch_progress.emit(100, "Batch complete.")
+                self.combined_done.emit(
+                    False, 0.0, "",
+                    "No pages were available to render — every input file failed.",
+                    files_ok, files_failed)
+                return
+
+            sealed_pdf = tmp / "combined_sealed.pdf"
+            with open(str(sealed_pdf), "wb") as fh:
+                combined_writer.write(fh)
+
+            self.batch_progress.emit(
+                95, f"Combining {total_sealed_pages} page(s) from "
+                    f"{files_ok} file(s) into one TIFF…")
+
+            try:
+                _, size_mb, out_name = self._render_combined_tiff(sealed_pdf)
+                self.batch_progress.emit(100, "Batch complete.")
+                self.combined_done.emit(
+                    True, size_mb, out_name, "", files_ok, files_failed)
             except Exception:
                 import traceback
-                err = traceback.format_exc()
-                failures += 1
-                self.page_failed.emit(file_idx, 0, err)
-                pages_done += max(file_page_counts[file_idx], 1)
-
-        self.batch_progress.emit(100, "Batch complete.")
-        self.all_done.emit(successes, failures)
+                self.batch_progress.emit(100, "Batch complete.")
+                self.combined_done.emit(
+                    False, 0.0, "", traceback.format_exc(), files_ok, files_failed)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -579,7 +601,7 @@ class MainWindow(QMainWindow):
         title = QLabel("DocSealer Batch")
         title.setStyleSheet(
             f"font-size: 24px; font-weight: 800; color: {C['text']}; letter-spacing: -0.5px;")
-        sub = QLabel("One sealed TIFF per input file · under 5 MB")
+        sub = QLabel("All input files merged into ONE sealed TIFF · under 5 MB")
         sub.setStyleSheet(f"font-size: 12px; color: {C['muted']};")
         title_col = QVBoxLayout()
         title_col.setSpacing(2)
@@ -785,13 +807,11 @@ class MainWindow(QMainWindow):
             f"font-size: 12px; color: {C['muted']}; padding: 2px;")
 
         self.results_list.clear()
-        self._page_items   = {}
         self._file_headers = {}
 
         for fi, fp in enumerate(files):
-            header = QListWidgetItem(f"  📄  {fp.name}")
-            header.setForeground(QColor(C['text']))
-            header.setFlags(header.flags() & ~Qt.ItemFlag.ItemIsSelectable)
+            header = QListWidgetItem(f"  ⏳  {fp.name}  →  pending…")
+            header.setForeground(QColor(C['muted']))
             self.results_list.addItem(header)
             self._file_headers[fi] = header
 
@@ -801,78 +821,79 @@ class MainWindow(QMainWindow):
         self._worker = BatchWorker(
             files, self.seal_preview.seal_path, self._output_folder)
         self._worker.batch_progress.connect(self._on_batch_progress)
-        self._worker.page_started.connect(self._on_page_started)
-        self._worker.page_done.connect(self._on_page_done)
-        self._worker.page_failed.connect(self._on_page_failed)
-        self._worker.all_done.connect(self._on_all_done)
+        self._worker.file_started.connect(self._on_file_started)
+        self._worker.file_sealed.connect(self._on_file_sealed)
+        self._worker.file_failed.connect(self._on_file_failed)
+        self._worker.combined_done.connect(self._on_combined_done)
         self._worker.start()
 
     def _on_batch_progress(self, pct: int, msg: str):
         self.progress_bar.setValue(pct)
         self.status_lbl.setText(msg)
 
-    def _get_or_create_page_item(self, file_idx: int, page_idx: int) -> QListWidgetItem:
-        # page_idx is always 0 now — one output file per input file.
-        key = (file_idx, page_idx)
-        if key in self._page_items:
-            return self._page_items[key]
-        fp   = Path(self.file_list.item(file_idx).data(Qt.ItemDataRole.UserRole))
-        item = QListWidgetItem(
-            f"      ⏳  {fp.stem}_sealed.tiff  →  pending…")
-        item.setForeground(QColor(C['muted']))
-        header_row = self.results_list.row(self._file_headers[file_idx])
-        self.results_list.insertItem(header_row + 1 + page_idx, item)
-        self._page_items[key] = item
-        return item
+    def _on_file_started(self, file_idx: int):
+        header = self._file_headers[file_idx]
+        fp = Path(self.file_list.item(file_idx).data(Qt.ItemDataRole.UserRole))
+        header.setText(f"  ⚙️  {fp.name}  →  sealing…")
+        header.setForeground(QColor(C['accent']))
+        self.results_list.scrollToItem(header)
 
-    def _on_page_started(self, file_idx: int, page_idx: int):
-        fp   = Path(self.file_list.item(file_idx).data(Qt.ItemDataRole.UserRole))
-        item = self._get_or_create_page_item(file_idx, page_idx)
-        item.setText(f"      ⚙️  {fp.stem}_sealed.tiff  →  sealing & rendering…")
-        item.setForeground(QColor(C['accent']))
-        self.results_list.scrollToItem(item)
+    def _on_file_sealed(self, file_idx: int):
+        header = self._file_headers[file_idx]
+        fp = Path(self.file_list.item(file_idx).data(Qt.ItemDataRole.UserRole))
+        header.setText(f"  ✅  {fp.name}  →  sealed & merged")
+        header.setForeground(QColor(C['success']))
 
-    def _on_page_done(self, file_idx: int, page_idx: int,
-                      size_mb: float, display: str):
-        fp    = Path(self.file_list.item(file_idx).data(Qt.ItemDataRole.UserRole))
-        item  = self._get_or_create_page_item(file_idx, page_idx)
-        under = size_mb <= 5.0
-        icon  = "✅" if under else "⚠️"
-        color = C['success'] if under else C['warning']
-        name  = display if display else f"{fp.stem}_sealed.tiff"
-        item.setText(f"      {icon}  {name}  ({size_mb:.2f} MB)")
-        item.setForeground(QColor(color))
-        self.results_list.scrollToItem(item)
-
-    def _on_page_failed(self, file_idx: int, page_idx: int, err: str):
-        fp   = Path(self.file_list.item(file_idx).data(Qt.ItemDataRole.UserRole))
-        item = self._get_or_create_page_item(file_idx, page_idx)
-        item.setText(
-            f"      ❌  {fp.stem}_sealed.tiff  →  failed (click to see error)")
-        item.setForeground(QColor(C['danger']))
-        item.setData(Qt.ItemDataRole.UserRole, err)
-        self.results_list.scrollToItem(item)
+    def _on_file_failed(self, file_idx: int, err: str):
+        header = self._file_headers[file_idx]
+        fp = Path(self.file_list.item(file_idx).data(Qt.ItemDataRole.UserRole))
+        header.setText(f"  ❌  {fp.name}  →  failed (click to see error)")
+        header.setForeground(QColor(C['danger']))
+        header.setData(Qt.ItemDataRole.UserRole, err)
 
     def _on_result_item_clicked(self, item: QListWidgetItem):
         err = item.data(Qt.ItemDataRole.UserRole)
         if err and "❌" in item.text():
             QMessageBox.critical(self, "Error Details", err)
 
-    def _on_all_done(self, successes: int, failures: int):
+    def _on_combined_done(self, success: bool, size_mb: float, out_name: str,
+                          err: str, files_ok: int, files_failed: int):
         self.run_btn.setEnabled(True)
-        total = successes + failures
-        if failures == 0:
-            color  = C['success']
-            msg    = f"✅  All {successes} page(s) sealed successfully."
-            border = C['success']
-        elif successes == 0:
-            color  = C['danger']
-            msg    = f"❌  All {failures} page(s) failed."
-            border = C['danger']
+
+        # Add one final row for the single combined output file.
+        if success:
+            under = size_mb <= 5.0
+            icon  = "✅" if under else "⚠️"
+            color = C['success'] if under else C['warning']
+            text  = f"  {icon}  Combined output: {out_name}  ({size_mb:.2f} MB)"
         else:
+            icon  = "❌"
+            color = C['danger']
+            text  = "  ❌  Combined output failed (click to see error)"
+
+        out_item = QListWidgetItem(text)
+        out_item.setForeground(QColor(color))
+        if not success:
+            out_item.setData(Qt.ItemDataRole.UserRole, err)
+        self.results_list.addItem(out_item)
+        self.results_list.scrollToItem(out_item)
+
+        total_files = files_ok + files_failed
+        if success and files_failed == 0:
+            color  = C['success']
+            msg    = (f"✅  All {files_ok} input file(s) merged into one "
+                     f"sealed TIFF ({size_mb:.2f} MB).")
+            border = C['success']
+        elif success:
             color  = C['warning']
-            msg    = f"⚠️  {successes} succeeded, {failures} failed."
+            msg    = (f"⚠️  {files_ok}/{total_files} file(s) merged; "
+                     f"{files_failed} failed. Output still produced "
+                     f"({size_mb:.2f} MB).")
             border = C['warning']
+        else:
+            color  = C['danger']
+            msg    = "❌  Batch failed — no output could be produced."
+            border = C['danger']
 
         self.summary_lbl.setText(msg)
         self.summary_lbl.setStyleSheet(
@@ -885,7 +906,7 @@ class MainWindow(QMainWindow):
             }}""")
         self.summary_frame.setVisible(True)
         self.status_lbl.setText(
-            f"Batch complete — {successes}/{total} pages processed.")
+            f"Batch complete — {files_ok}/{total_files} file(s) merged.")
 
     def _open_folder(self):
         if self._output_folder:
